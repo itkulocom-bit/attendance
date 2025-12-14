@@ -16,15 +16,8 @@ try:
     SUPABASE_AVAILABLE = True
 except ImportError:
     SUPABASE_AVAILABLE = False
-    st.warning("⚠️ Install supabase: pip install supabase")
 
-# Face recognition imports
-try:
-    from deepface import DeepFace
-    DEEPFACE_AVAILABLE = True
-except ImportError:
-    DEEPFACE_AVAILABLE = False
-
+# OpenCV for face detection
 try:
     import cv2
     OPENCV_AVAILABLE = True
@@ -51,15 +44,12 @@ def init_supabase():
         SUPABASE_KEY = st.secrets.get("SUPABASE_KEY", "")
         
         if not SUPABASE_URL or not SUPABASE_KEY:
-            st.sidebar.warning("⚠️ Setup Supabase Secrets")
             return None
         
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-        st.sidebar.success("✅ Supabase Connected")
         return supabase
         
-    except Exception as e:
-        st.sidebar.error(f"❌ Connection Error")
+    except:
         return None
 
 # ========== DATABASE FUNCTIONS ==========
@@ -88,7 +78,6 @@ def save_student(supabase, nim, nama, kelas, foto_base64=None):
             "updated_at": datetime.now().isoformat()
         }
         
-        # Check if exists
         existing = supabase.table("students").select("*").eq("nim", nim).execute()
         if existing.data:
             supabase.table("students").update(data).eq("nim", nim).execute()
@@ -97,8 +86,7 @@ def save_student(supabase, nim, nama, kelas, foto_base64=None):
             supabase.table("students").insert(data).execute()
         
         return True
-    except Exception as e:
-        st.error(f"Error: {str(e)[:100]}")
+    except:
         return False
 
 def save_attendance(supabase, nim, nama, kelas, status, foto_base64=None, confidence=None):
@@ -119,8 +107,7 @@ def save_attendance(supabase, nim, nama, kelas, status, foto_base64=None, confid
         
         supabase.table("attendance").insert(data).execute()
         return True
-    except Exception as e:
-        st.error(f"Error: {str(e)[:100]}")
+    except:
         return False
 
 def get_attendance_report(supabase, start_date=None, end_date=None):
@@ -161,11 +148,11 @@ def image_to_base64(image, max_size=(400, 400)):
     except:
         return None
 
-# ========== FACE VERIFICATION FUNCTIONS ==========
-def check_face_quality(image_base64):
-    """Check if image contains a clear face"""
+# ========== FACE DETECTION & VERIFICATION ==========
+def detect_faces(image_base64):
+    """Detect faces in image using OpenCV"""
     if not OPENCV_AVAILABLE:
-        return True, "OpenCV tidak tersedia"
+        return [], "OpenCV tidak tersedia"
     
     try:
         # Decode image
@@ -174,17 +161,20 @@ def check_face_quality(image_base64):
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         
         if img is None:
-            return False, "Gambar tidak valid"
+            return [], "Gambar tidak valid"
         
         # Convert to grayscale
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         
         # Load Haar cascade
         cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+        if not os.path.exists(cascade_path):
+            return [], "File detektor wajah tidak ditemukan"
+        
         face_cascade = cv2.CascadeClassifier(cascade_path)
         
         if face_cascade.empty():
-            return True, "Face detector tidak tersedia"
+            return [], "Gagal memuat detektor wajah"
         
         # Detect faces
         faces = face_cascade.detectMultiScale(
@@ -194,159 +184,188 @@ def check_face_quality(image_base64):
             minSize=(100, 100)
         )
         
-        if len(faces) == 0:
-            return False, "❌ Wajah tidak terdeteksi"
-        elif len(faces) > 1:
-            return False, "❌ Terdeteksi lebih dari satu wajah"
+        face_count = len(faces)
+        
+        if face_count == 0:
+            return [], "❌ Wajah tidak terdeteksi"
+        elif face_count > 1:
+            return [], f"❌ Terdeteksi {face_count} wajah (harus 1)"
         else:
-            # Check face size
+            # Get face coordinates
             x, y, w, h = faces[0]
-            face_area = w * h
-            img_area = img.shape[0] * img.shape[1]
             
-            if face_area < img_area * 0.1:
-                return False, "❌ Wajah terlalu kecil"
-            elif face_area > img_area * 0.8:
-                return False, "❌ Wajah terlalu besar"
-            else:
-                return True, f"✅ Wajah terdeteksi"
-                
+            # Calculate face position and size
+            img_height, img_width = img.shape[:2]
+            face_area = w * h
+            img_area = img_width * img_height
+            face_ratio = face_area / img_area
+            
+            # Check face quality
+            if face_ratio < 0.05:  # Face too small
+                return [], "❌ Wajah terlalu kecil, dekatkan ke kamera"
+            elif face_ratio > 0.7:  # Face too large
+                return [], "❌ Wajah terlalu besar, jauhkan dari kamera"
+            
+            # Extract face region
+            face_img = img[y:y+h, x:x+w]
+            
+            # Convert back to base64
+            _, buffer = cv2.imencode('.jpg', face_img)
+            face_base64 = base64.b64encode(buffer).decode('utf-8')
+            
+            return [(x, y, w, h, face_base64)], f"✅ Wajah terdeteksi ({int(face_ratio*100)}% frame)"
+            
     except Exception as e:
-        return False, f"Error: {str(e)[:100]}"
+        return [], f"Error: {str(e)[:100]}"
 
-def compare_faces_deepface(img1_base64, img2_base64):
-    """Face comparison using DeepFace"""
-    if not DEEPFACE_AVAILABLE:
-        return False, 0, 0
+def extract_face_features(image_base64):
+    """Extract simple features from face for comparison"""
+    try:
+        # Decode image
+        img_data = base64.b64decode(image_base64)
+        nparr = np.frombuffer(img_data, np.uint8)
+        
+        # If it's a color image, decode normally
+        try:
+            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            if img is None:
+                # Try as grayscale
+                img = cv2.imdecode(nparr, cv2.IMREAD_GRAYSCALE)
+        except:
+            # Use PIL as fallback
+            img = Image.open(io.BytesIO(img_data)).convert('L')
+            img = np.array(img)
+        
+        if img is None:
+            return None
+        
+        # Resize to standard size
+        img_resized = cv2.resize(img, (128, 128))
+        
+        # Convert to grayscale if needed
+        if len(img_resized.shape) == 3:
+            img_resized = cv2.cvtColor(img_resized, cv2.COLOR_BGR2GRAY)
+        
+        # Flatten and normalize
+        features = img_resized.flatten()
+        features = features / 255.0
+        
+        # Simple feature extraction (histogram)
+        hist = cv2.calcHist([img_resized], [0], None, [64], [0, 256])
+        hist = hist.flatten()
+        hist = hist / hist.sum() if hist.sum() > 0 else hist
+        
+        return {
+            'pixels': features,
+            'histogram': hist,
+            'shape': img_resized.shape
+        }
+        
+    except:
+        return None
+
+def compare_faces_features(ref_features, test_features):
+    """Compare two faces using extracted features"""
+    if ref_features is None or test_features is None:
+        return 0
     
     try:
-        # Create temp files
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as f1:
-            img1_data = base64.b64decode(img1_base64)
-            f1.write(img1_data)
-            img1_path = f1.name
-        
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as f2:
-            img2_data = base64.b64decode(img2_base64)
-            f2.write(img2_data)
-            img2_path = f2.name
-        
-        try:
-            # Compare faces
-            result = DeepFace.verify(
-                img1_path=img1_path,
-                img2_path=img2_path,
-                model_name="Facenet",
-                detector_backend="opencv",
-                distance_metric="cosine",
-                enforce_detection=False
+        # Compare histograms (correlation)
+        if 'histogram' in ref_features and 'histogram' in test_features:
+            hist_corr = cv2.compareHist(
+                ref_features['histogram'].astype(np.float32),
+                test_features['histogram'].astype(np.float32),
+                cv2.HISTCMP_CORREL
             )
+            hist_score = (hist_corr + 1) / 2 * 100  # Convert to 0-100 scale
+        else:
+            hist_score = 0
+        
+        # Compare pixel values (cosine similarity)
+        if 'pixels' in ref_features and 'pixels' in test_features:
+            ref_pixels = ref_features['pixels']
+            test_pixels = test_features['pixels']
             
-            # Clean up
-            os.unlink(img1_path)
-            os.unlink(img2_path)
+            dot_product = np.dot(ref_pixels, test_pixels)
+            norm_ref = np.linalg.norm(ref_pixels)
+            norm_test = np.linalg.norm(test_pixels)
             
-            distance = result.get("distance", 1.0)
-            similarity = max(0, 100 - (distance * 100))
-            match = result.get("verified", False)
-            
-            return match, similarity, distance
-            
-        except Exception as e:
-            # Clean up on error
-            if os.path.exists(img1_path):
-                os.unlink(img1_path)
-            if os.path.exists(img2_path):
-                os.unlink(img2_path)
-            return False, 0, 0
-            
-    except:
-        return False, 0, 0
-
-def compare_faces_simple(img1_base64, img2_base64):
-    """Simple image comparison"""
-    try:
-        # Decode images
-        img1_data = base64.b64decode(img1_base64)
-        img2_data = base64.b64decode(img2_base64)
+            if norm_ref > 0 and norm_test > 0:
+                cosine_sim = dot_product / (norm_ref * norm_test)
+                pixel_score = max(0, cosine_sim * 100)
+            else:
+                pixel_score = 0
+        else:
+            pixel_score = 0
         
-        # Open images
-        img1 = Image.open(io.BytesIO(img1_data)).convert('L').resize((128, 128))
-        img2 = Image.open(io.BytesIO(img2_data)).convert('L').resize((128, 128))
+        # Combined score (weighted average)
+        combined_score = (hist_score * 0.6) + (pixel_score * 0.4)
         
-        # Convert to arrays
-        arr1 = np.array(img1).flatten()
-        arr2 = np.array(img2).flatten()
-        
-        # Normalize
-        arr1 = arr1 / 255.0
-        arr2 = arr2 / 255.0
-        
-        # Calculate similarity
-        dot_product = np.dot(arr1, arr2)
-        norm1 = np.linalg.norm(arr1)
-        norm2 = np.linalg.norm(arr2)
-        
-        if norm1 == 0 or norm2 == 0:
-            return False, 0
-        
-        similarity = dot_product / (norm1 * norm2)
-        similarity_percent = similarity * 100
-        
-        match = similarity_percent > 65
-        
-        return match, similarity_percent
+        return min(100, max(0, combined_score))
         
     except:
-        return False, 0
+        return 0
 
-def verify_face_attendance(reference_base64, attendance_photo):
-    """Main face verification function"""
-    if not attendance_photo:
+def verify_face_simple(reference_base64, test_photo):
+    """Simple but effective face verification"""
+    if not test_photo:
         return False, 0, "Tidak ada foto absensi"
     
     if not reference_base64:
         return False, 0, "Siswa belum punya foto referensi"
     
     try:
-        # Convert attendance photo to base64
-        image = Image.open(attendance_photo)
-        attendance_base64 = image_to_base64(image)
+        # Convert test photo to base64
+        test_image = Image.open(test_photo)
+        test_base64 = image_to_base64(test_image)
         
-        if not attendance_base64:
-            return False, 0, "Gagal memproses foto absensi"
+        if not test_base64:
+            return False, 0, "Gagal memproses foto"
         
-        # Check face quality in attendance photo
-        face_ok, face_msg = check_face_quality(attendance_base64)
-        if not face_ok:
-            return False, 0, f"Kualitas foto buruk: {face_msg}"
+        # Step 1: Detect faces in both images
+        ref_faces, ref_msg = detect_faces(reference_base64)
+        test_faces, test_msg = detect_faces(test_base64)
         
-        # Try DeepFace first
-        if DEEPFACE_AVAILABLE:
-            match, confidence, distance = compare_faces_deepface(reference_base64, attendance_base64)
-            method = "DeepFace"
-            
-            if match and confidence > 60:
-                return True, confidence, f"✅ Wajah cocok ({method}: {confidence:.1f}%)"
-            elif confidence > 40:
-                # Borderline case
-                return False, confidence, f"⚠️ Kemiripan rendah ({method}: {confidence:.1f}%)"
+        if not ref_faces:
+            return False, 0, f"Foto referensi: {ref_msg}"
+        if not test_faces:
+            return False, 0, f"Foto absensi: {test_msg}"
+        
+        # Step 2: Extract features from detected faces
+        ref_face_base64 = ref_faces[0][4]  # Extracted face image
+        test_face_base64 = test_faces[0][4]
+        
+        ref_features = extract_face_features(ref_face_base64)
+        test_features = extract_face_features(test_face_base64)
+        
+        if ref_features is None:
+            return False, 0, "Gagal ekstraksi fitur referensi"
+        if test_features is None:
+            return False, 0, "Gagal ekstraksi fitur absensi"
+        
+        # Step 3: Compare features
+        similarity_score = compare_faces_features(ref_features, test_features)
+        
+        # Determine match based on threshold
+        match_threshold = 65  # Adjust based on testing
+        is_match = similarity_score >= match_threshold
+        
+        # Provide detailed feedback
+        if is_match:
+            if similarity_score >= 80:
+                message = f"✅ WAJAH COCOK! ({similarity_score:.1f}%)"
             else:
-                return False, confidence, f"❌ Wajah tidak cocok ({method}: {confidence:.1f}%)"
-        
-        # Fallback to simple comparison
-        match, confidence = compare_faces_simple(reference_base64, attendance_base64)
-        method = "SimpleMatch"
-        
-        if match and confidence > 70:
-            return True, confidence, f"✅ Wajah cocok ({method}: {confidence:.1f}%)"
-        elif confidence > 50:
-            return False, confidence, f"⚠️ Kemiripan rendah ({method}: {confidence:.1f}%)"
+                message = f"✅ Wajah cocok ({similarity_score:.1f}%)"
         else:
-            return False, confidence, f"❌ Wajah tidak cocok ({method}: {confidence:.1f}%)"
+            if similarity_score >= 50:
+                message = f"⚠️ Kemiripan rendah ({similarity_score:.1f}%)"
+            else:
+                message = f"❌ Wajah tidak cocok ({similarity_score:.1f}%)"
+        
+        return is_match, similarity_score, message
         
     except Exception as e:
-        return False, 0, f"Error: {str(e)[:100]}"
+        return False, 0, f"Error verifikasi: {str(e)[:100]}"
 
 # ========== ATTENDANCE WITH VERIFICATION ==========
 def save_attendance_with_verification(supabase, student, attendance_photo, status):
@@ -357,9 +376,9 @@ def save_attendance_with_verification(supabase, student, attendance_photo, statu
         
         if not reference_photo:
             # No reference photo, allow with warning
-            st.warning("⚠️ Siswa belum punya foto referensi. Absensi tetap disimpan.")
+            st.warning("⚠️ Siswa belum punya foto referensi")
             
-            # Save without verification
+            # Convert and save
             image = Image.open(attendance_photo)
             attendance_base64 = image_to_base64(image)
             
@@ -376,10 +395,13 @@ def save_attendance_with_verification(supabase, student, attendance_photo, statu
             else:
                 success = True
             
-            return success, "Absensi disimpan (tanpa verifikasi)"
+            if success:
+                return True, "Absensi disimpan (tanpa verifikasi wajah)"
+            else:
+                return False, "Gagal menyimpan"
         
         # Perform face verification
-        verification_result, confidence, message = verify_face_attendance(
+        verification_result, confidence, message = verify_face_simple(
             reference_photo, 
             attendance_photo
         )
@@ -387,48 +409,50 @@ def save_attendance_with_verification(supabase, student, attendance_photo, statu
         # Display verification result
         st.info(f"**Hasil Verifikasi:** {message}")
         
-        # Handle verification result
+        # Handle different verification outcomes
         if not verification_result:
-            if confidence > 40:  # Borderline case
-                st.warning("""
-                ⚠️ **PERINGATAN: Kemiripan wajah rendah!**
+            if confidence >= 50:  # Borderline case
+                st.warning(f"""
+                ⚠️ **PERINGATAN!**
                 
-                Apakah Anda yakin ini orang yang sama?
+                Kecocokan wajah hanya {confidence:.1f}%
+                Mungkin ini orang yang sama dengan ekspresi/pose berbeda?
                 """)
                 
                 col1, col2 = st.columns(2)
                 with col1:
-                    override = st.checkbox("Ya, tetap simpan")
+                    override = st.checkbox("Ya, ini orang yang sama")
                 with col2:
-                    if st.button("❌ Batalkan", type="secondary"):
+                    if st.button("❌ Batalkan", type="secondary", key="cancel_borderline"):
                         return False, "Absensi dibatalkan"
                 
                 if not override:
-                    return False, "Verifikasi wajah gagal"
+                    return False, f"Verifikasi gagal ({confidence:.1f}%)"
             else:
                 # Definitely not match
-                st.error("""
+                st.error(f"""
                 ❌ **WAJAH TIDAK COCOK!**
                 
-                Orang yang melakukan absensi berbeda dengan siswa terdaftar.
+                Kecocokan hanya {confidence:.1f}%
+                Orang yang absen berbeda dengan siswa terdaftar.
                 """)
                 
-                # Show both photos for comparison
-                col1, col2 = st.columns(2)
-                with col1:
+                # Show comparison
+                col_compare1, col_compare2 = st.columns(2)
+                with col_compare1:
                     st.write("**Foto Referensi:**")
                     ref_data = base64.b64decode(reference_photo)
                     ref_img = Image.open(io.BytesIO(ref_data))
                     st.image(ref_img, caption=student['nama'], width=200)
                 
-                with col2:
+                with col_compare2:
                     st.write("**Foto Absensi:**")
                     att_img = Image.open(attendance_photo)
                     st.image(att_img, caption="Foto saat absen", width=200)
                 
-                return False, "Wajah tidak cocok dengan data siswa"
+                return False, f"Wajah tidak cocok ({confidence:.1f}%)"
         
-        # Save attendance
+        # Save successful attendance
         image = Image.open(attendance_photo)
         attendance_base64 = image_to_base64(image)
         
@@ -446,7 +470,7 @@ def save_attendance_with_verification(supabase, student, attendance_photo, statu
             success = True
         
         if success:
-            return True, f"Absensi berhasil! Confidence: {confidence:.1f}%"
+            return True, f"✅ Absensi berhasil! Kecocokan: {confidence:.1f}%"
         else:
             return False, "Gagal menyimpan ke database"
         
@@ -466,17 +490,16 @@ def main():
         st.divider()
         
         # System status
+        status_text = []
         if supabase:
-            st.success("✅ Supabase Connected")
-        else:
-            st.warning("📱 Mode Offline")
+            status_text.append("✅ Database")
+        if OPENCV_AVAILABLE:
+            status_text.append("✅ Face Detection")
         
-        if DEEPFACE_AVAILABLE:
-            st.success("🤖 DeepFace Ready")
-        elif OPENCV_AVAILABLE:
-            st.info("👁️ OpenCV Ready")
+        if status_text:
+            st.success(" • ".join(status_text))
         else:
-            st.error("❌ No Face Recognition")
+            st.warning("⚠️ Mode Terbatas")
         
         st.divider()
         
@@ -485,7 +508,7 @@ def main():
             students = get_all_students(supabase) if supabase else []
             today_att = get_attendance_report(supabase, date.today(), date.today()) if supabase else []
             
-            st.metric("Siswa Terdaftar", len(students))
+            st.metric("Siswa", len(students))
             st.metric("Absensi Hari Ini", len(today_att))
         except:
             pass
@@ -493,38 +516,20 @@ def main():
         st.divider()
         
         # Quick actions
-        if st.button("🔄 Refresh Data", use_container_width=True):
+        if st.button("🔄 Refresh", use_container_width=True):
             st.rerun()
         
-        if st.button("📊 Export Data", use_container_width=True):
-            if supabase:
-                data = get_attendance_report(supabase)
-                if data:
-                    df = pd.DataFrame(data)
-                    csv = df.to_csv(index=False)
-                    st.download_button(
-                        "📥 Download CSV",
-                        data=csv,
-                        file_name=f"absensi_{date.today().strftime('%Y%m%d')}.csv",
-                        key="sidebar_download"
-                    )
-        
         st.divider()
-        st.caption(f"v2.0 • {date.today().strftime('%d/%m/%Y')}")
+        st.caption(f"v2.1 • {date.today().strftime('%d/%m/%Y')}")
 
     # ========== MAIN CONTENT ==========
-    st.title("📱 Sistem Absensi Wajah Digital")
-    st.markdown("**Dengan Verifikasi Wajah Otomatis**")
+    st.title("📱 Sistem Absensi Wajah")
+    st.markdown("**Dengan Verifikasi Wajah Menggunakan OpenCV**")
     
     # Create tabs
-    tab1, tab2, tab3, tab4 = st.tabs([
-        "📸 Absensi", 
-        "👥 Data Siswa", 
-        "📊 Laporan", 
-        "⚙️ Pengaturan"
-    ])
+    tab1, tab2, tab3 = st.tabs(["📸 Absensi", "👥 Data Siswa", "📊 Laporan"])
     
-    # ========== TAB 1: ATTENDANCE WITH VERIFICATION ==========
+    # ========== TAB 1: ATTENDANCE ==========
     with tab1:
         st.header("📸 Absensi dengan Verifikasi Wajah")
         
@@ -538,44 +543,37 @@ def main():
                 st.warning("""
                 ⚠️ **Belum ada siswa terdaftar!**
                 
-                Silakan daftarkan siswa terlebih dahulu di tab **👥 Data Siswa**.
+                Daftarkan siswa dulu di tab **👥 Data Siswa**.
                 """)
             else:
                 # Student selection
                 student_names = [s.get('nama', '') for s in students]
-                selected_name = st.selectbox(
-                    "Pilih Siswa:", 
-                    student_names,
-                    key="attendance_select"
-                )
+                selected_name = st.selectbox("Pilih Siswa:", student_names)
                 
                 if selected_name:
                     selected_student = next(s for s in students if s.get('nama') == selected_name)
                     
                     # Display student info
-                    with st.expander("ℹ️ Info Siswa", expanded=True):
-                        col_info1, col_info2 = st.columns(2)
-                        with col_info1:
-                            st.write(f"**NIM:** {selected_student.get('nim', '')}")
-                            st.write(f"**Kelas:** {selected_student.get('kelas', '')}")
-                        
-                        with col_info2:
-                            # Display reference photo if exists
-                            if selected_student.get('foto_base64'):
-                                try:
-                                    ref_data = base64.b64decode(selected_student['foto_base64'])
-                                    ref_img = Image.open(io.BytesIO(ref_data))
-                                    st.image(ref_img, caption="Foto Referensi", width=100)
-                                except:
-                                    st.write("📷 Foto tersedia")
-                            else:
-                                st.warning("⚠️ Belum ada foto")
+                    st.info(f"""
+                    **Info Siswa:**
+                    - NIM: {selected_student.get('nim', '')}
+                    - Kelas: {selected_student.get('kelas', '')}
+                    - Foto Referensi: {'✅ Ada' if selected_student.get('foto_base64') else '❌ Belum ada'}
+                    """)
+                    
+                    # Show reference photo if available
+                    if selected_student.get('foto_base64'):
+                        try:
+                            ref_data = base64.b64decode(selected_student['foto_base64'])
+                            ref_img = Image.open(io.BytesIO(ref_data))
+                            st.image(ref_img, caption="Foto Referensi", width=150)
+                        except:
+                            pass
                     
                     # Attendance photo
-                    st.subheader("Foto Absensi")
+                    st.subheader("Ambil Foto Absensi")
                     attendance_photo = st.camera_input(
-                        "Ambil foto wajah untuk absensi",
-                        help="Pastikan wajah jelas dan pencahayaan cukup",
+                        "Hadapkan wajah ke kamera",
                         key="attendance_camera"
                     )
                     
@@ -583,12 +581,10 @@ def main():
                         st.image(attendance_photo, caption="Foto yang akan diverifikasi", width=200)
                     
                     # Status selection
-                    st.subheader("Status Kehadiran")
                     status = st.radio(
-                        "Pilih status:",
+                        "Status Kehadiran:",
                         ["Hadir", "Izin", "Sakit", "Alpha"],
-                        horizontal=True,
-                        key="status_radio"
+                        horizontal=True
                     )
                     
                     # Submit button
@@ -625,214 +621,106 @@ def main():
                 df_today = pd.DataFrame(today_data)
                 
                 # Display statistics
-                st.markdown("**Statistik Hari Ini:**")
-                
                 col_stat1, col_stat2, col_stat3, col_stat4 = st.columns(4)
                 with col_stat1:
-                    hadir_count = len(df_today[df_today['status'] == 'Hadir'])
-                    st.metric("Hadir", hadir_count, delta=f"{hadir_count} orang")
-                
+                    hadir = len(df_today[df_today['status'] == 'Hadir'])
+                    st.metric("Hadir", hadir)
                 with col_stat2:
-                    izin_count = len(df_today[df_today['status'] == 'Izin'])
-                    st.metric("Izin", izin_count)
-                
+                    izin = len(df_today[df_today['status'] == 'Izin'])
+                    st.metric("Izin", izin)
                 with col_stat3:
-                    sakit_count = len(df_today[df_today['status'] == 'Sakit'])
-                    st.metric("Sakit", sakit_count)
-                
+                    sakit = len(df_today[df_today['status'] == 'Sakit'])
+                    st.metric("Sakit", sakit)
                 with col_stat4:
-                    alpha_count = len(df_today[df_today['status'] == 'Alpha'])
-                    st.metric("Alpha", alpha_count)
+                    alpha = len(df_today[df_today['status'] == 'Alpha'])
+                    st.metric("Alpha", alpha)
                 
-                # Display attendance table
-                st.markdown("**Detail Absensi:**")
-                
-                # Prepare display dataframe
-                display_cols = ['nama', 'kelas', 'status', 'confidence']
-                if all(col in df_today.columns for col in display_cols):
-                    display_df = df_today[display_cols].copy()
+                # Display table
+                if 'confidence' in df_today.columns and 'nama' in df_today.columns:
+                    display_df = df_today[['nama', 'status', 'confidence']].copy()
                     display_df['confidence'] = display_df['confidence'].apply(
                         lambda x: f"{x:.1f}%" if pd.notnull(x) and x > 0 else "-"
                     )
                     
-                    st.dataframe(
-                        display_df,
-                        use_container_width=True,
-                        hide_index=True,
-                        column_config={
-                            "nama": "Nama",
-                            "kelas": "Kelas",
-                            "status": "Status",
-                            "confidence": "Kecocokan"
-                        }
-                    )
-                
-                # Recent photos (if any)
-                photos_data = []
-                for idx, row in df_today.iterrows():
-                    if pd.notnull(row.get('foto_base64')):
-                        photos_data.append({
-                            'nama': row.get('nama', ''),
-                            'foto_base64': row.get('foto_base64')
-                        })
-                
-                if photos_data:
-                    st.markdown("**Foto Absensi Terbaru:**")
-                    cols = st.columns(min(3, len(photos_data)))
-                    for idx, photo_data in enumerate(photos_data[:3]):
-                        with cols[idx % 3]:
-                            try:
-                                img_data = base64.b64decode(photo_data['foto_base64'])
-                                img = Image.open(io.BytesIO(img_data))
-                                st.image(img, caption=photo_data['nama'], width=100)
-                            except:
-                                pass
+                    st.dataframe(display_df, use_container_width=True, hide_index=True)
             else:
                 st.info("📝 Belum ada absensi hari ini")
-                
-                # Show sample for new users
-                with st.expander("📋 Cara menggunakan:"):
-                    st.markdown("""
-                    1. **Pilih siswa** dari dropdown di kolom kiri
-                    2. **Ambil foto** dengan kamera atau upload foto
-                    3. **Pilih status** kehadiran
-                    4. **Klik 'Simpan Absensi'**
-                    
-                    Sistem akan:
-                    - Memverifikasi kecocokan wajah dengan foto referensi
-                    - Menyimpan data ke database cloud
-                    - Menampilkan hasil verifikasi
-                    """)
     
     # ========== TAB 2: STUDENT DATA ==========
     with tab2:
-        st.header("👥 Manajemen Data Siswa")
+        st.header("👥 Data Siswa")
         
         col1, col2 = st.columns([1, 2])
         
         with col1:
             st.subheader("Tambah/Edit Siswa")
             
-            with st.form("student_form", clear_on_submit=True):
-                nim = st.text_input("NIM *", max_chars=20, help="Nomor Induk Mahasiswa/Siswa")
+            with st.form("student_form"):
+                nim = st.text_input("NIM *", max_chars=20)
                 nama = st.text_input("Nama Lengkap *", max_chars=100)
-                kelas = st.selectbox(
-                    "Kelas *", 
-                    ["XII IPA 1", "XII IPA 2", "XII IPA 3", "XII IPS 1", "XII IPS 2", "Lainnya"]
-                )
+                kelas = st.selectbox("Kelas *", ["XII IPA 1", "XII IPA 2", "XII IPA 3", "XII IPS 1", "XII IPS 2"])
                 
-                st.markdown("**Foto Wajah (untuk verifikasi)**")
-                student_photo = st.file_uploader(
-                    "Upload foto wajah yang jelas",
-                    type=['jpg', 'jpeg', 'png'],
-                    key="student_photo_upload"
-                )
+                st.write("Foto Wajah")
+                student_photo = st.file_uploader("Upload foto wajah", type=['jpg', 'jpeg', 'png'])
                 
                 if student_photo:
-                    preview_img = Image.open(student_photo)
-                    st.image(preview_img, caption="Preview", width=150)
+                    st.image(student_photo, width=150)
                 
-                submitted = st.form_submit_button("💾 Simpan Data Siswa", type="primary")
-                
-                if submitted:
+                if st.form_submit_button("💾 Simpan", type="primary"):
                     if nim and nama and kelas:
-                        # Process photo
                         foto_base64 = None
                         if student_photo:
                             image = Image.open(student_photo)
                             foto_base64 = image_to_base64(image)
-                            
-                            # Check photo quality
-                            if foto_base64 and OPENCV_AVAILABLE:
-                                face_ok, face_msg = check_face_quality(foto_base64)
-                                if not face_ok:
-                                    st.warning(f"⚠️ {face_msg}")
                         
-                        # Save student
-                        with st.spinner("Menyimpan data..."):
-                            if supabase:
-                                success = save_student(supabase, nim, nama, kelas, foto_base64)
-                            else:
-                                success = True
-                            
-                            if success:
-                                st.success(f"✅ {nama} berhasil disimpan!")
-                                time.sleep(1)
-                                st.rerun()
-                    else:
-                        st.error("❌ Harap isi semua field yang wajib (*)")
+                        if supabase:
+                            success = save_student(supabase, nim, nama, kelas, foto_base64)
+                        else:
+                            success = True
+                        
+                        if success:
+                            st.success(f"✅ {nama} tersimpan!")
+                            time.sleep(1)
+                            st.rerun()
         
         with col2:
-            st.subheader("Daftar Siswa Terdaftar")
+            st.subheader("Daftar Siswa")
             
-            # Get students
             students = get_all_students(supabase) if supabase else []
             
             if students:
-                # Convert to DataFrame
                 df_students = pd.DataFrame(students)
                 
-                # Display table without photo data
-                display_cols = [col for col in df_students.columns if col != 'foto_base64']
-                display_df = df_students[display_cols]
+                # Remove photo column for display
+                if 'foto_base64' in df_students.columns:
+                    display_df = df_students.drop(columns=['foto_base64'])
+                else:
+                    display_df = df_students
                 
-                # Format datetime columns
-                for col in ['created_at', 'updated_at']:
-                    if col in display_df.columns:
-                        display_df[col] = pd.to_datetime(display_df[col]).dt.strftime('%d/%m/%Y %H:%M')
+                st.dataframe(display_df, use_container_width=True, hide_index=True)
                 
-                st.dataframe(
-                    display_df,
-                    use_container_width=True,
-                    hide_index=True,
-                    column_config={
-                        "nim": "NIM",
-                        "nama": "Nama",
-                        "kelas": "Kelas",
-                        "created_at": "Dibuat",
-                        "updated_at": "Diupdate"
-                    }
-                )
-                
-                # Export button
+                # Export
                 csv_data = display_df.to_csv(index=False)
                 st.download_button(
-                    "📥 Export Data Siswa (CSV)",
+                    "📥 Export CSV",
                     data=csv_data,
-                    file_name=f"data_siswa_{date.today().strftime('%Y%m%d')}.csv",
-                    mime="text/csv",
-                    use_container_width=True
+                    file_name=f"siswa_{date.today().strftime('%Y%m%d')}.csv"
                 )
-                
-                # Student count by class
-                st.subheader("Statistik per Kelas")
-                if 'kelas' in df_students.columns:
-                    class_stats = df_students['kelas'].value_counts()
-                    st.bar_chart(class_stats)
             else:
-                st.info("📝 Belum ada siswa terdaftar")
+                st.info("📝 Belum ada siswa")
     
     # ========== TAB 3: REPORTS ==========
     with tab3:
-        st.header("📊 Laporan & Analisis")
+        st.header("📊 Laporan")
         
-        # Date range filter
-        st.subheader("Filter Periode")
+        # Date filter
+        col1, col2 = st.columns(2)
+        with col1:
+            start_date = st.date_input("Dari", value=date.today())
+        with col2:
+            end_date = st.date_input("Sampai", value=date.today())
         
-        col_filter1, col_filter2, col_filter3 = st.columns([1, 1, 2])
-        
-        with col_filter1:
-            start_date = st.date_input("Dari Tanggal", value=date.today())
-        
-        with col_filter2:
-            end_date = st.date_input("Sampai Tanggal", value=date.today())
-        
-        with col_filter3:
-            st.write("")  # Spacer
-            if st.button("🔍 Terapkan Filter", use_container_width=True):
-                st.rerun()
-        
-        # Get filtered data
+        # Get report
         report_data = []
         if supabase:
             report_data = get_attendance_report(supabase, start_date, end_date)
@@ -840,261 +728,49 @@ def main():
         if report_data:
             df_report = pd.DataFrame(report_data)
             
-            # Display statistics
-            st.subheader("📈 Statistik")
-            
-            stat_col1, stat_col2, stat_col3, stat_col4 = st.columns(4)
-            
-            with stat_col1:
+            # Stats
+            st.subheader("Statistik")
+            col_a, col_b, col_c = st.columns(3)
+            with col_a:
                 total = len(df_report)
-                st.metric("Total Absensi", total)
+                st.metric("Total", total)
+            with col_b:
+                unique = df_report['nama'].nunique()
+                st.metric("Siswa Unik", unique)
+            with col_c:
+                if 'confidence' in df_report.columns:
+                    avg_conf = df_report['confidence'].mean()
+                    st.metric("Rata Kecocokan", f"{avg_conf:.1f}%")
             
-            with stat_col2:
-                unique_students = df_report['nama'].nunique()
-                st.metric("Siswa Unik", unique_students)
+            # Data
+            st.subheader("Data")
+            display_cols = ['created_at', 'nama', 'status']
+            if 'confidence' in df_report.columns:
+                display_cols.append('confidence')
             
-            with stat_col3:
-                hadir_count = len(df_report[df_report['status'] == 'Hadir'])
-                hadir_pct = (hadir_count / total * 100) if total > 0 else 0
-                st.metric("Presentase Hadir", f"{hadir_pct:.1f}%")
-            
-            with stat_col4:
-                avg_confidence = df_report['confidence'].mean() if 'confidence' in df_report.columns else 0
-                st.metric("Rata-rata Kecocokan", f"{avg_confidence:.1f}%" if avg_confidence > 0 else "-")
-            
-            # Display data table
-            st.subheader("📋 Data Absensi")
-            
-            # Prepare display columns
-            display_cols_report = ['created_at', 'nama', 'kelas', 'status', 'confidence']
-            if all(col in df_report.columns for col in display_cols_report):
-                display_df_report = df_report[display_cols_report].copy()
-                
-                # Format columns
-                display_df_report['created_at'] = pd.to_datetime(display_df_report['created_at']).dt.strftime('%d/%m/%Y %H:%M')
-                display_df_report['confidence'] = display_df_report['confidence'].apply(
-                    lambda x: f"{x:.1f}%" if pd.notnull(x) and x > 0 else "-"
-                )
-                
-                st.dataframe(
-                    display_df_report,
-                    use_container_width=True,
-                    hide_index=True,
-                    column_config={
-                        "created_at": "Waktu",
-                        "nama": "Nama",
-                        "kelas": "Kelas",
-                        "status": "Status",
-                        "confidence": "Kecocokan"
-                    }
-                )
-            
-            # Charts
-            st.subheader("📊 Visualisasi Data")
-            
-            chart_col1, chart_col2 = st.columns(2)
-            
-            with chart_col1:
-                # Status distribution
-                status_dist = df_report['status'].value_counts()
-                if not status_dist.empty:
-                    st.markdown("**Distribusi Status**")
-                    st.bar_chart(status_dist)
-            
-            with chart_col2:
-                # Daily trend
-                if 'created_at' in df_report.columns:
-                    df_report['date'] = pd.to_datetime(df_report['created_at']).dt.date
-                    daily_count = df_report.groupby('date').size()
-                    if not daily_count.empty:
-                        st.markdown("**Trend Harian**")
-                        st.line_chart(daily_count)
-            
-            # Export options
-            st.subheader("📤 Export Data")
-            
-            export_col1, export_col2 = st.columns(2)
-            
-            with export_col1:
-                # CSV export
-                csv_report = df_report.to_csv(index=False)
-                st.download_button(
-                    "📥 Download CSV",
-                    data=csv_report,
-                    file_name=f"laporan_absensi_{start_date}_{end_date}.csv",
-                    mime="text/csv",
-                    use_container_width=True
-                )
-            
-            with export_col2:
-                # Summary report
-                summary_data = {
-                    'Periode': [f"{start_date} sampai {end_date}"],
-                    'Total Absensi': [total],
-                    'Siswa Unik': [unique_students],
-                    'Presentase Hadir': [f"{hadir_pct:.1f}%"]
-                }
-                df_summary = pd.DataFrame(summary_data)
-                summary_csv = df_summary.to_csv(index=False)
-                
-                st.download_button(
-                    "📄 Download Ringkasan",
-                    data=summary_csv,
-                    file_name=f"ringkasan_{start_date}_{end_date}.csv",
-                    mime="text/csv",
-                    use_container_width=True
-                )
-        else:
-            st.info(f"📝 Tidak ada data absensi dari {start_date} sampai {end_date}")
-    
-    # ========== TAB 4: SETTINGS ==========
-    with tab4:
-        st.header("⚙️ Pengaturan Sistem")
-        
-        col_set1, col_set2 = st.columns(2)
-        
-        with col_set1:
-            st.subheader("Konfigurasi Sistem")
-            
-            # Verification settings
-            st.markdown("**Pengaturan Verifikasi:**")
-            
-            verification_method = st.selectbox(
-                "Metode Verifikasi Wajah",
-                ["Auto (Rekomendasi)", "DeepFace", "Simple Match", "Tanpa Verifikasi"],
-                help="Pilih metode verifikasi wajah yang digunakan"
-            )
-            
-            min_confidence = st.slider(
-                "Minimum Kecocokan (%)",
-                min_value=0,
-                max_value=100,
-                value=60,
-                help="Nilai minimum kecocokan wajah untuk dianggap valid"
-            )
-            
-            # Photo settings
-            st.markdown("**Pengaturan Foto:**")
-            
-            photo_quality = st.select_slider(
-                "Kualitas Foto",
-                options=["Rendah", "Sedang", "Tinggi"],
-                value="Sedang"
-            )
-            
-            max_photo_size = st.number_input(
-                "Ukuran Maks Foto (KB)",
-                min_value=10,
-                max_value=1024,
-                value=200,
-                help="Ukuran maksimal foto yang diupload"
-            )
-        
-        with col_set2:
-            st.subheader("Status Sistem")
-            
-            # System info
-            st.markdown("**Informasi Sistem:**")
-            
-            info_col1, info_col2 = st.columns(2)
-            
-            with info_col1:
-                st.metric("Versi Aplikasi", "2.0.0")
-                st.metric("Database", "Supabase" if supabase else "Lokal")
-                
-            with info_col2:
-                st.metric("Face Recognition", 
-                         "DeepFace" if DEEPFACE_AVAILABLE else 
-                         "OpenCV" if OPENCV_AVAILABLE else "Tidak tersedia")
-                st.metric("Python Version", "3.13")
-            
-            # System actions
-            st.markdown("**Aksi Sistem:**")
-            
-            if st.button("🔄 Clear Cache", use_container_width=True):
-                st.cache_resource.clear()
-                st.success("Cache cleared!")
-                time.sleep(1)
-                st.rerun()
-            
-            if st.button("🧪 Test Connection", use_container_width=True):
-                if supabase:
-                    try:
-                        test = supabase.table("students").select("count", count="exact").execute()
-                        st.success(f"✅ Koneksi OK. Tabel students: {len(get_all_students(supabase))} data")
-                    except Exception as e:
-                        st.error(f"❌ Error: {str(e)[:100]}")
-                else:
-                    st.warning("⚠️ Supabase tidak terhubung")
-        
-        # Database management
-        st.subheader("Manajemen Database")
-        
-        db_col1, db_col2, db_col3 = st.columns(3)
-        
-        with db_col1:
-            if st.button("📊 Backup Data", use_container_width=True):
-                if supabase:
-                    students_data = get_all_students(supabase)
-                    attendance_data = get_attendance_report(supabase)
-                    
-                    backup = {
-                        "students": students_data,
-                        "attendance": attendance_data,
-                        "backup_date": datetime.now().isoformat()
-                    }
-                    
-                    import json
-                    backup_json = json.dumps(backup, indent=2)
-                    
-                    st.download_button(
-                        "💾 Download Backup",
-                        data=backup_json,
-                        file_name=f"backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-                        mime="application/json"
+            if all(col in df_report.columns for col in display_cols):
+                display_df = df_report[display_cols].copy()
+                if 'confidence' in display_df.columns:
+                    display_df['confidence'] = display_df['confidence'].apply(
+                        lambda x: f"{x:.1f}%" if pd.notnull(x) else "-"
                     )
-        
-        with db_col2:
-            if st.button("🗑️ Clear All Data", type="secondary", use_container_width=True):
-                st.warning("""
-                ⚠️ **PERINGATAN:** 
-                Aksi ini akan menghapus SEMUA data!
-                """)
                 
-                confirm = st.checkbox("Saya mengerti dan ingin menghapus semua data")
-                if confirm and st.button("🚨 Konfirmasi Hapus", type="primary"):
-                    st.error("Fitur ini belum diimplementasikan untuk keamanan")
-        
-        with db_col3:
-            if st.button("📋 System Logs", use_container_width=True):
-                st.info("""
-                **Log Sistem:**
-                - Aplikasi berjalan normal
-                - Database: Connected
-                - Face Recognition: Ready
-                - Last update: Now
-                """)
-
+                st.dataframe(display_df, use_container_width=True, hide_index=True)
+            
+            # Export
+            csv_report = df_report.to_csv(index=False)
+            st.download_button(
+                "📥 Download Laporan",
+                data=csv_report,
+                file_name=f"laporan_{start_date}_{end_date}.csv",
+                use_container_width=True
+            )
+        else:
+            st.info(f"📝 Tidak ada data {start_date} sampai {end_date}")
+    
     # ========== FOOTER ==========
     st.divider()
-    
-    footer_col1, footer_col2, footer_col3 = st.columns([1, 2, 1])
-    
-    with footer_col2:
-        current_time = datetime.now().strftime('%H:%M:%S')
-        
-        # System status indicators
-        status_indicators = []
-        if supabase:
-            status_indicators.append("✅ Database")
-        if DEEPFACE_AVAILABLE or OPENCV_AVAILABLE:
-            status_indicators.append("✅ Face Recognition")
-        
-        status_text = " • ".join(status_indicators) if status_indicators else "⚠️ Limited Mode"
-        
-        st.caption(f"""
-        **Absensi Digital v2.0** • {status_text} • {current_time}
-        """)
+    st.caption(f"Absensi Wajah v2.1 • {datetime.now().strftime('%H:%M:%S')}")
 
 # ========== RUN APP ==========
 if __name__ == "__main__":
