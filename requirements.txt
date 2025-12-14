@@ -5,3 +5,4 @@ Pillow
 python-multipart
 deepface
 opencv-python-headless
+numpy
