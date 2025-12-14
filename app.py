@@ -5,6 +5,10 @@ import pandas as pd
 from datetime import datetime
 import base64
 
+# Di app.py, tambahkan:
+import sys
+st.write(f"Python version: {sys.version}")
+
 # ========== SIMPLE FACE COMPARE ==========
 def simple_image_compare(img1_bytes, img2_bytes):
     """Simple comparison for MVP"""
