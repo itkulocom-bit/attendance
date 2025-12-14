@@ -1,273 +1,207 @@
 import streamlit as st
-import cv2
-import numpy as np
-from datetime import datetime
-import gspread
-from google.oauth2.service_account import Credentials
-from PIL import Image
+from supabase import create_client, Client
 import face_recognition
+import numpy as np
+from PIL import Image
+from datetime import datetime
 import tempfile
 import os
 
-# ========== CONFIGURATION ==========
-st.set_page_config(
-    page_title="Pintu Ujian - Face Verification",
-    page_icon="🎓",
-    layout="centered"
-)
-
-# ========== TITLE ==========
-st.title("🎓 PINTU MASUK UJIAN")
-st.markdown("**Hanya peserta terdaftar yang bisa masuk**")
-
-# ========== INITIALIZE SESSION STATE ==========
-if 'verified' not in st.session_state:
-    st.session_state.verified = False
-if 'verified_name' not in st.session_state:
-    st.session_state.verified_name = ""
-if 'attempts' not in st.session_state:
-    st.session_state.attempts = []
-
-# ========== GOOGLE SHEETS CONNECTION ==========
+# ========== SUPABASE CONFIG ==========
 @st.cache_resource
-def connect_to_sheets():
-    # Download credentials from Streamlit secrets or local file
-    try:
-        # For Streamlit Cloud (using secrets)
-        creds_dict = st.secrets["google_credentials"]
-        creds = Credentials.from_service_account_info(creds_dict)
-    except:
-        # For local development
-        import json
-        with open('credentials.json') as f:
-            creds_dict = json.load(f)
-        creds = Credentials.from_service_account_info(creds_dict)
+def init_supabase():
+    # Untuk production: simpan di Streamlit Secrets
+    SUPABASE_URL = st.secrets.get("SUPABASE_URL", "https://your-project.supabase.co")
+    SUPABASE_KEY = st.secrets.get("SUPABASE_KEY", "your-anon-key")
     
-    client = gspread.authorize(creds)
-    return client
+    return create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# ========== LOAD REGISTERED STUDENTS ==========
-def load_registered_students():
+# ========== STREAMLIT APP ==========
+st.set_page_config(page_title="Absensi Wajah", layout="wide")
+st.title("🎓 Absensi Wajah dengan Supabase")
+
+# Inisialisasi Supabase
+supabase = init_supabase()
+
+# ========== FUNGSI DATABASE ==========
+def get_all_students():
+    """Ambil semua data siswa dari Supabase"""
     try:
-        client = connect_to_sheets()
-        sheet = client.open("ExamAttendanceDB").worksheet("registered_students")
-        records = sheet.get_all_records()
-        
-        # Convert to face encodings
-        students = []
-        for record in records:
-            if record['Status'] == 'Active':
-                # Download and encode face
-                img_path = download_image(record['Foto_URL'])
-                if img_path:
-                    encoding = get_face_encoding(img_path)
-                    if encoding is not None:
-                        students.append({
-                            'nim': record['NIM'],
-                            'nama': record['Nama'],
-                            'encoding': encoding,
-                            'foto_url': record['Foto_URL']
-                        })
-        return students
+        response = supabase.table("students").select("*").execute()
+        return response.data
     except Exception as e:
-        st.error(f"Error loading students: {str(e)}")
+        st.error(f"Error: {str(e)}")
         return []
 
-# ========== FACE PROCESSING FUNCTIONS ==========
-def download_image(url):
-    """Download image from URL to temp file"""
-    import requests
+def save_attendance(student_data, confidence):
+    """Simpan data absensi"""
     try:
-        response = requests.get(url, timeout=10)
-        if response.status_code == 200:
-            # Create temp file
-            with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as f:
-                f.write(response.content)
-                return f.name
-    except:
-        pass
-    return None
-
-def get_face_encoding(image_path):
-    """Extract face encoding from image"""
-    try:
-        image = face_recognition.load_image_file(image_path)
-        encodings = face_recognition.face_encodings(image)
-        if len(encodings) > 0:
-            return encodings[0]
-    except:
-        pass
-    return None
-
-def compare_faces(known_encoding, test_encoding, threshold=0.6):
-    """Compare two face encodings"""
-    if known_encoding is None or test_encoding is None:
-        return False, 0
-    
-    distance = face_recognition.face_distance([known_encoding], test_encoding)[0]
-    similarity = (1 - distance) * 100
-    return distance < threshold, similarity
-
-# ========== VERIFICATION FUNCTION ==========
-def verify_face(captured_image):
-    """Compare captured face with registered students"""
-    students = load_registered_students()
-    if not students:
-        st.error("Database siswa kosong atau error")
-        return None, 0
-    
-    # Encode captured face
-    test_encoding = get_face_encoding(captured_image)
-    if test_encoding is None:
-        st.error("Wajah tidak terdeteksi di foto")
-        return None, 0
-    
-    # Compare with all registered students
-    best_match = None
-    best_similarity = 0
-    
-    for student in students:
-        match, similarity = compare_faces(student['encoding'], test_encoding)
-        if match and similarity > best_similarity:
-            best_match = student
-            best_similarity = similarity
-    
-    if best_match and best_similarity > 70:  # Threshold 70%
-        return best_match, best_similarity
-    else:
-        return None, best_similarity
-
-# ========== LOG ATTEMPT ==========
-def log_attempt(nim, nama, status, confidence):
-    """Log verification attempt to Google Sheets"""
-    try:
-        client = connect_to_sheets()
-        sheet = client.open("ExamAttendanceDB").worksheet("attendance_log")
+        data = {
+            "nim": student_data.get("nim", ""),
+            "nama": student_data.get("nama", ""),
+            "status": "HADIR",
+            "confidence": confidence
+        }
         
-        sheet.append_row([
-            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            nim if nim else "-",
-            nama if nama else "Unknown",
-            status,
-            f"{confidence:.1f}%"
-        ])
+        response = supabase.table("attendance").insert(data).execute()
+        return True
     except Exception as e:
-        st.error(f"Gagal menyimpan log: {str(e)}")
+        st.error(f"Gagal simpan: {str(e)}")
+        return False
+
+def register_new_student(nim, nama, foto_url=None):
+    """Registrasi siswa baru"""
+    try:
+        data = {
+            "nim": nim,
+            "nama": nama,
+            "foto_url": foto_url
+        }
+        
+        response = supabase.table("students").insert(data).execute()
+        return True
+    except:
+        return False
+
+# ========== FACE RECOGNITION ==========
+def process_face_image(image):
+    """Process image untuk face recognition"""
+    try:
+        # Convert to numpy array
+        img_array = np.array(image)
+        
+        # Find face encodings
+        face_encodings = face_recognition.face_encodings(img_array)
+        
+        if len(face_encodings) > 0:
+            return face_encodings[0]
+    except:
+        pass
+    return None
 
 # ========== MAIN APP ==========
-def main():
-    # Sidebar for registered students
-    with st.sidebar:
-        st.header("📋 Peserta Terdaftar")
-        students = load_registered_students()
-        for student in students:
-            st.write(f"**{student['nama']}** - {student['nim']}")
-        
-        st.divider()
-        st.header("📊 Log Attempt")
-        if st.session_state.attempts:
-            for attempt in st.session_state.attempts[-5:]:  # Show last 5
-                st.text(f"{attempt['time']}: {attempt['name']} - {attempt['status']}")
+tab1, tab2, tab3 = st.tabs(["📸 Absensi", "👥 Data Siswa", "📊 Dashboard"])
+
+with tab1:
+    st.header("Absensi Wajah")
     
-    # Main verification area
-    if not st.session_state.verified:
-        st.subheader("🔍 Verifikasi Wajah untuk Masuk")
-        
+    # Load registered faces
+    students = get_all_students()
+    
+    if not students:
+        st.warning("Belum ada siswa terdaftar. Tambah dulu di tab Data Siswa.")
+    else:
         col1, col2 = st.columns([2, 1])
         
         with col1:
             # Camera input
-            picture = st.camera_input(
-                "Hadapkan wajah ke kamera",
-                help="Pastikan cahaya cukup dan wajah terlihat jelas"
-            )
+            picture = st.camera_input("Ambil foto wajah")
             
             if picture:
-                # Save captured image to temp file
-                with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as f:
-                    f.write(picture.getvalue())
-                    temp_path = f.name
+                # Process image
+                image = Image.open(picture)
+                st.image(image, caption="Foto yang diambil", width=300)
                 
-                # Verify face
-                with st.spinner("Memverifikasi wajah..."):
-                    result, confidence = verify_face(temp_path)
+                # Extract face encoding
+                with st.spinner("Memproses wajah..."):
+                    encoding = process_face_image(image)
                     
-                    # Clean up temp file
-                    os.unlink(temp_path)
-                    
-                    if result:
-                        # SUCCESS - Verified
-                        st.session_state.verified = True
-                        st.session_state.verified_name = result['nama']
+                    if encoding is not None:
+                        # TODO: Compare dengan database siswa
+                        # Untuk sekarang, manual selection dulu
+                        st.success("✅ Wajah terdeteksi!")
                         
-                        # Log successful attempt
-                        log_attempt(result['nim'], result['nama'], "Verified", confidence)
-                        st.session_state.attempts.append({
-                            'time': datetime.now().strftime("%H:%M:%S"),
-                            'name': result['nama'],
-                            'status': '✅ Verified'
-                        })
+                        # Pilih siswa (sementara)
+                        selected_name = st.selectbox(
+                            "Pilih siswa:",
+                            [s["nama"] for s in students]
+                        )
                         
-                        st.rerun()
+                        if st.button("Simpan Absensi"):
+                            student = next(s for s in students if s["nama"] == selected_name)
+                            if save_attendance(student, 95.0):
+                                st.balloons()
+                                st.success(f"✅ {selected_name} berhasil diabsen!")
                     else:
-                        # FAILED - Not recognized
-                        st.error(f"⚠️ Wajah tidak dikenali (Kecocokan: {confidence:.1f}%)")
-                        
-                        # Log failed attempt
-                        log_attempt(None, "Unknown", "Rejected", confidence)
-                        st.session_state.attempts.append({
-                            'time': datetime.now().strftime("%H:%M:%S"),
-                            'name': "Unknown",
-                            'status': '❌ Rejected'
-                        })
-        
-        with col2:
-            st.info("**Peserta yang bisa masuk:**")
-            st.success("✅ Sastro")
-            st.success("✅ Muda")
-            st.success("✅ Jabal")
-            st.error("❌ Orang lain")
-            
-            st.divider()
-            st.caption("""
-            **Instruksi:**
-            1. Hadap kamera
-            2. Tunggu verifikasi
-            3. Jika berhasil, bisa masuk
-            """)
-    
-    else:
-        # SUCCESS SCREEN
-        st.balloons()
-        st.success(f"## ✅ SELAMAT DATANG, {st.session_state.verified_name}!")
-        st.markdown("### Anda telah terverifikasi dan **BOLEH MASUK** ujian.")
-        
-        # Exam information
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("Status", "TERVERIFIKASI")
-        with col2:
-            st.metric("Waktu Masuk", datetime.now().strftime("%H:%M"))
-        with col3:
-            st.metric("Kursi", "A-12")  # Could be from database
-        
-        st.divider()
-        
-        # Rules and instructions
-        st.markdown("**Peraturan Ujian:**")
-        st.markdown("""
-        1. Tunjukkan ini kepada pengawas
-        2. Duduk di kursi yang ditentukan
-        3. Simpan HP di tas
-        4. Waktu ujian: 120 menit
-        """)
-        
-        # Reset button for next person
-        if st.button("🔁 Verifikasi Peserta Berikutnya"):
-            st.session_state.verified = False
-            st.session_state.verified_name = ""
-            st.rerun()
+                        st.error("❌ Wajah tidak terdeteksi")
 
-# ========== RUN APP ==========
-if __name__ == "__main__":
-    main()
+with tab2:
+    st.header("Data Siswa")
+    
+    # Tampilkan data siswa
+    students = get_all_students()
+    
+    if students:
+        st.dataframe(students)
+    else:
+        st.info("Belum ada data siswa")
+    
+    # Form tambah siswa baru
+    with st.expander("➕ Tambah Siswa Baru"):
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            nim = st.text_input("NIM")
+            nama = st.text_input("Nama Lengkap")
+        
+        with col2:
+            foto_file = st.file_uploader("Upload Foto", type=['jpg', 'png'])
+        
+        if st.button("Simpan Siswa"):
+            if nim and nama:
+                # Simpan foto ke temp (nanti bisa upload ke Supabase Storage)
+                foto_url = None
+                if foto_file:
+                    # Upload logic here
+                    pass
+                
+                if register_new_student(nim, nama, foto_url):
+                    st.success(f"✅ {nama} berhasil ditambahkan!")
+                    st.rerun()
+            else:
+                st.warning("Isi NIM dan Nama dulu!")
+
+with tab3:
+    st.header("Dashboard Absensi")
+    
+    # Get attendance data
+    try:
+        response = supabase.table("attendance").select("*").execute()
+        attendance_data = response.data
+        
+        if attendance_data:
+            # Convert to DataFrame untuk display
+            import pandas as pd
+            df = pd.DataFrame(attendance_data)
+            
+            # Stats
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Total Absensi", len(df))
+            with col2:
+                today = datetime.now().date()
+                today_count = len([a for a in attendance_data 
+                                 if a['created_at'].startswith(str(today))])
+                st.metric("Hari Ini", today_count)
+            with col3:
+                unique_students = df['nama'].nunique()
+                st.metric("Siswa Unique", unique_students)
+            
+            # Data table
+            st.dataframe(df)
+            
+            # Download button
+            csv = df.to_csv(index=False)
+            st.download_button(
+                "📥 Download CSV",
+                data=csv,
+                file_name="absensi.csv"
+            )
+        else:
+            st.info("Belum ada data absensi")
+    except Exception as e:
+        st.error(f"Error: {str(e)}")
+
+# ========== FOOTER ==========
+st.divider()
+st.caption("Powered by Supabase • Face Attendance System v1.0")
